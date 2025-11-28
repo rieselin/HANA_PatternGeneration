@@ -1,0 +1,125 @@
+# Projekt Code Mustergenerierung
+
+Projekt Code als Text-File aus dem PDF **ohne funktionierenden** Zusammenhang.
+
+```python
+### Listing 1 : Startwert $u_0, v_0$
+l_init = l_dom/n_dom*20
+gfuold.Set(IfPos((l_init/2)**2-x*x,
+                 IfPos((l_init/2)**2-y*y,0.5,1),1))
+gfvold.Set(IfPos((l_init/2)**2-x*x,
+                 IfPos((l_init/2)**2-y*y,0.25,0),0))
+gfxold.vec[:] += 0.01*np.random.normal(size=X.ndof)
+gfx.vec.data = gfxold.vec
+
+### Listing 2 : FEM space definition
+order = 3
+V = Periodic(H1(mesh,order=order))
+X = V*V
+(u,v) = X.TrialFunction()
+(w,q) = X.TestFunction() 
+
+### Listing 3 : Gridfunction
+# Loesung zum neuen Zeitschritt
+gfx = GridFunction(X)
+gfu, gfv = gfx.components
+
+# Loesung zum alten Zeitschritt
+gfxold = GridFunction(X)
+gfuold, gfvold = gfxold.components
+
+### Listing 4 : Definition, Berechnung von $M^*$ aus (\ref{eq:discParabDelta}).
+dt = 10.
+mstar = a.mat.CreateMatrix()
+mstar.AsVector().data = m.mat.AsVector() + dt*a.mat.AsVector()
+mstarinv = mstar.Inverse(inverse='sparsecholesky')
+
+### Listing 5 : Periodische Geometrie, Mesh
+l_dom = 1.5 # Laenge des Quadrats
+n_dom = 75 # Anzahl Elemente pro Kante
+rec = MoveTo(-l_dom/2,-l_dom/2).Rectangle(l_dom,l_dom).Face()
+
+# Namen der Kanten
+rec.edges.Max(Xocc).name = 'right'
+rec.edges.Min(Xocc).name = 'left'
+rec.edges.Max(Yocc).name = 'top'
+rec.edges.Min(Yocc).name = 'bottom'
+
+# Identifizierung links <-> rechts
+right=rec.edges.Max(Xocc)
+rec.edges.Min(Xocc).Identify(right,name="left")
+
+# Identifizierung oben <-> unten
+top=rec.edges.Max(Yocc)
+rec.edges.Min(Yocc).Identify(top,name="bottom")
+
+# Geometrie erstellen
+geo= OCCGeometry(rec,dim=2)
+
+# Mesh generieren
+mesh = Mesh(geo.GenerateMesh(maxh=l_dom/n_dom))
+
+### Listing 6 : Parameter
+eps1 = Parameter(2e-5)
+eps2 = Parameter(1e-5)
+F = Parameter(0.048)
+k = Parameter(0.065)
+
+### Listing 7 : Bilinearformen
+a = BilinearForm(X,symmetric=True)
+a += eps1*grad(u)*grad(w)*dx
+a += eps2*grad(v)*grad(q)*dx
+a.Assemble()
+
+m = BilinearForm(X,symmetric=True)
+m += u*w*dx
+m += v*q*dx
+m.Assemble()
+
+### Listing 8 : Linearform
+f = LinearForm(X)
+f += dt*(-gfuold*gfvold**2+F*(1-gfuold))*w*dx(bonus_intorder=4)
+f += dt*(gfuold*gfvold**2-(k+F)*gfvold)*q*dx(bonus_intorder=4)
+
+### Listing 9 : Zeit-Loop
+scene = Draw(gfu)
+scene2 = Draw(gfv)
+
+res = gfx.vec.CreateVector()
+deltauv = gfx.vec.CreateVector()
+with TaskManager():
+    for j in range(2000):
+        f.Assemble() # nicht vergessen!
+        <snipp, selber machen>
+        
+        # Update Visualisierung in jedem 10. Schritt
+        if j % 10 == 0:
+            scene.Redraw()
+            scene2.Redraw()
+        deltauvNorm = deltauv.Norm()
+        print(j,deltauvNorm,end='\r')
+        # Abbruch, wenn sich nichts mehr aendert
+        if deltauvNorm < 1e-8:
+            print('stopping, no change in solution')
+            break
+            
+### Listing 10 : Export Figure
+# Anzahl Pixel
+Npixel = 800
+# Sampling kartesisch
+xi = np.linspace(-l_dom/2,l_dom/2,Npixel)
+Xi,Yi = np.meshgrid(xi,xi)
+mips = mesh(Xi.flatten(),Yi.flatten())
+
+# Loesung berechnen
+ui = gfu(mips)
+ui = ui.reshape((Npixel,Npixel))
+
+# Visualisieren
+plt.figure(figsize=(5,5))
+plt.imshow(ui>.5, cmap='gray_r')
+plt.axis('off')
+plt.tight_layout()
+plt.savefig('example.pdf')
+plt.show()
+```
