@@ -1,254 +1,334 @@
-# save as gray_scott_sweep.py and run with your ngsolve environment
-import os
-import itertools
 import scipy as scipy
 import matplotlib.pyplot as plt
-import sympy as sp
 import numpy as np
-from ngsolve import *
-from netgen.occ import *
-from netgen.occ import X, Y, Z as Xgen, Y, Z
-from netgen.occ import OCCGeometry
-from ngsolve.webgui import Draw
 from datetime import datetime
+import os
+import pandas as pd
 
-# ---- User-tweakable sweep settings ----
-dts = [ 10.0, 20.0, 40.0]              # list of dt values to test
-n_doms = [50, 75]              # mesh resolution (n_dom in your code)
-orders = [1, 2, 3]                     # polynomial orders to test
-max_steps = 3000                    # ensure all runs record up to this many steps
-tol = 1e-8                          # stopping tolerance (same as your code)
-snapshot_eval_N = 300               # evaluation grid size for comparing solutions
-output_dir = "sweep_output"
-os.makedirs(output_dir, exist_ok=True)
+from ngsolve.meshes import MakeStructured2DMesh
+from ngsolve import *
 
-# structured mesh umstellen
+# ---------------------------------------
+# Configuration
+# ---------------------------------------
+dts = [1.0, 5.0, 10.0]
+n_doms = [10, 20, 40]
+orders = [1, 2, 3]
 
-# ---- Fixed model parameters (from your script) ----
+# Fixed parameters
 l_dom = 1.5
-eps1 = Parameter(2e-5)
-eps2 = Parameter(1e-5)
-F = Parameter(0.056)
-k = Parameter(0.065)
+eps1_val = 2e-5
+eps2_val = 1e-5
+F_val = 0.05
+k_val = 0.065
 
-# ---- Helper: run one simulation with given parameters ----
-def run_simulation(dt, n_dom, order, max_steps, tol, eval_points):
-    """
-    Returns dict with:
-      'dt','n_dom','order',
-      'deltanorms': list length <= max_steps,
-      'final_u_grid', 'final_v_grid'  (both arrays shape eval_points.shape0),
-      'stopping_step' (None if never below tol before max_steps),
-      'steps_ran' (int)
-    """
-    # --- geometry and mesh ---
-    rec = MoveTo(-l_dom/2, -l_dom/2).Rectangle(l_dom, l_dom).Face()
-    rec.edges.Max(Xgen).name = 'right'
-    rec.edges.Min(Xgen).name = 'left'
-    rec.edges.Max(Y).name = 'top'
-    rec.edges.Min(Y).name = 'bottom'
-    right = rec.edges.Max(Xgen)
-    rec.edges.Min(Xgen).Identify(right, name="left")
-    top = rec.edges.Max(Y)
-    rec.edges.Min(Y).Identify(top, name="bottom")
-    geo = OCCGeometry(rec, dim=2)
-    mesh = Mesh(geo.GenerateMesh(maxh=l_dom/n_dom))
+# Simulation parameters
+T_final = 2000.0  # Final time for all simulations
+max_newton_iter = 10
+newton_tol = 1e-8
 
-    for i in range(3):
-        mesh.Refine()
-    # print summary
-    print(f"Sim: dt={dt}, n_dom={n_dom}, order={order} -> ne={mesh.ne}, nv={mesh.nv}")
+# Reference solution parameters (finest grid)
+dt_ref = 0.5
+n_dom_ref = 80
+order_ref = 3
 
-    # --- FE spaces ---
-    V = Periodic(H1(mesh, order=order))
-    X = V * V
-    u, v = X.TrialFunction()
-    w, q = X.TestFunction()
+# ---------------------------------------
+# Helper Functions
+# ---------------------------------------
 
-    gfx = GridFunction(X)
-    gfu, gfv = gfx.components
-    gfxold = GridFunction(X)
-    gfuold, gfvold = gfxold.components
+def create_mesh(l_dom, n_dom):
+    """Create structured 2D mesh with quadrilaterals or triangles"""
+    mesh = MakeStructured2DMesh(
+        quads=False, nx=n_dom, ny=n_dom,
+        mapping=lambda x, y: (x * l_dom - l_dom/2, y * l_dom - l_dom/2)
+    )
+    return mesh
 
-    # initial conditions (copy your logic)
+def set_initial_conditions(gfuold, gfvold, l_dom, n_dom):
+    """Set initial conditions with small perturbation"""
     l_init = l_dom / n_dom * 20
+
     gfuold.Set(IfPos((l_init/2)**2 - x*x,
                      IfPos((l_init/2)**2 - y*y, 0.5, 1), 1))
     gfvold.Set(IfPos((l_init/2)**2 - x*x,
                      IfPos((l_init/2)**2 - y*y, 0.25, 0), 0))
-    gfxold.vec[:] += 0.01 * np.random.normal(size=X.ndof)
+
+    # Add same random seed for reproducibility
+    np.random.seed(42)
+    ndof = gfuold.space.ndof + gfvold.space.ndof
+    return 0.01 * np.random.normal(size=ndof)
+
+def run_simulation(dt, n_dom, order, T_final, verbose=False):
+    """Run Gray-Scott simulation with given parameters"""
+    
+    # Create mesh
+    mesh = create_mesh(l_dom, n_dom)
+    
+    # Setup finite element space
+    V = Periodic(H1(mesh, order=order))
+    X = V * V
+    u, v = X.TrialFunction()
+    w, q = X.TestFunction()
+    
+    # Grid functions
+    gfx = GridFunction(X)
+    gfu, gfv = gfx.components
+    gfxold = GridFunction(X)
+    gfuold, gfvold = gfxold.components
+    
+    # Initial conditions
+    perturbation = set_initial_conditions(gfuold, gfvold, l_dom, n_dom)
+    gfxold.vec[:] += perturbation
     gfx.vec.data = gfxold.vec
-
-
+    
+    # Parameters
+    eps1 = Parameter(eps1_val)
+    eps2 = Parameter(eps2_val)
+    F = Parameter(F_val)
+    k = Parameter(k_val)
+    
+    # Assemble matrices
     a = BilinearForm(X, symmetric=True)
     a += eps1 * grad(u) * grad(w) * dx
     a += eps2 * grad(v) * grad(q) * dx
     a.Assemble()
-
+    
     m = BilinearForm(X, symmetric=True)
     m += u*w*dx
     m += v*q*dx
     m.Assemble()
-
-    # build M* = M + dt*A (matrix)
+    
+    # M* = M + dt/2*A (for trapezoidal rule)
     mstar = a.mat.CreateMatrix()
-    mstar.AsVector().data = m.mat.AsVector() + dt * a.mat.AsVector()
+    mstar.AsVector().data = m.mat.AsVector() + (dt/2.0) * a.mat.AsVector()
     mstarinv = mstar.Inverse(inverse="sparsecholesky")
+    
+    # Helper vectors
+    res = gfx.vec.CreateVector()
 
-    # linear form f (explicit nonlinearity)
     f = LinearForm(X)
-    f += dt*(-gfuold*gfvold**2 + F*(1-gfuold))*w*dx(bonus_intorder=4)
-    f += dt*(gfuold*gfvold**2 - (k+F)*gfvold)*q*dx(bonus_intorder=4)
+    f += dt*(-gfuold*gfvold**2+F*(1-gfuold))*w*dx(bonus_intorder=4)
+    f += dt*(gfuold*gfvold**2-(k+F)*gfvold)*q*dx(bonus_intorder=4)
 
-    # time integration
-    deltanorms = []
     res = gfx.vec.CreateVector()
     deltauv = gfx.vec.CreateVector()
-
-    scene_u = None  # no Draw to speed batch runs
-
-    stopping_step = None
-    steps_ran = 0
-
+    
+    # Time stepping
+    nsteps = int(T_final / dt)
+    t = 0.0
+    
     with TaskManager():
-        for j in range(max_steps):
+        for j in range(nsteps):
+            # Assemble right-hand side f (explicit nonlinearity)
             f.Assemble()
+
+            # Solve M* δ = -dt*A*u_old + f
             res.data = -dt * a.mat * gfxold.vec + f.vec
             deltauv.data = mstarinv * res
             gfx.vec.data = gfxold.vec + deltauv
+
+            # Update for next step
             gfxold.vec.data = gfx.vec
 
-            deltan = deltauv.Norm()
-            deltanorms.append(deltan)
-            steps_ran += 1
-
-            if deltan < tol:
-                stopping_step = j
+            # Visualize every 10 steps
+            # if j % 10 == 0:
+            #     scene_u.Redraw()
+            #     scene_v.Redraw()
+            deltauvNorm = deltauv.Norm()
+            print(j,deltauvNorm,end='\r')
+                    
+            if deltauvNorm < newton_tol:
                 break
+                
+            gfxold.vec.data = gfx.vec
+            
+            if verbose and j % 10 == 0:
+                print(f"  Step {j}/{nsteps}, t={t:.2f}", end='\r')
+    
+    if verbose:
+        print(f"\nSimulation completed: dt={dt}, n_dom={n_dom}, order={order}")
+    
+    return gfu, gfv, mesh
 
-    # Evaluate final u,v on eval_points (a list/array of (x,y) coords)
-    Xi, Yi = eval_points
-    pts = mesh(Xi.flatten(), Yi.flatten())
-    u_final = gfu(pts).reshape(Xi.shape)
-    v_final = gfv(pts).reshape(Xi.shape)
+def compute_L2_error(gfu1, gfu2, mesh1, mesh2):
+    """Compute L2 error between two solutions by interpolation"""
+    # Sample on a fine grid
+    Npixel = 200
+    xi = np.linspace(-l_dom/2, l_dom/2, Npixel)
+    Xi, Yi = np.meshgrid(xi, xi)
+    
+    mips1 = mesh1(Xi.flatten(), Yi.flatten())
+    mips2 = mesh2(Xi.flatten(), Yi.flatten())
+    
+    u1_vals = gfu1(mips1)
+    u2_vals = gfu2(mips2)
+    
+    # L2 error
+    diff = u1_vals - u2_vals
+    l2_error = np.sqrt(np.mean(diff**2))
+    l2_norm = np.sqrt(np.mean(u2_vals**2))
+    
+    return l2_error, l2_norm
 
-    return {
-        'dt': dt,
-        'n_dom': n_dom,
-        'order': order,
-        'deltanorms': np.array(deltanorms),
-        'final_u_grid': u_final,
-        'final_v_grid': v_final,
-        'stopping_step': stopping_step,
-        'steps_ran': steps_ran
-    }
+# ---------------------------------------
+# Main Error Analysis
+# ---------------------------------------
 
-# ---- Prepare evaluation grid (common grid for all comparisons) ----
-Npix = snapshot_eval_N
-xi = np.linspace(-l_dom/2, l_dom/2, Npix)
-Xi, Yi = np.meshgrid(xi, xi)
 
-# ---- Run sweep ----
-combos = list(itertools.product(dts, n_doms, orders))
+# Compute reference solution
+print("\n[1/2] Computing reference solution...")
+print(f"    Parameters: dt={dt_ref}, n_dom={n_dom_ref}, order={order_ref}")
+gfu_ref, gfv_ref, mesh_ref = run_simulation(
+    dt_ref, n_dom_ref, order_ref, T_final, verbose=True
+)
+
+# Store results
 results = []
-print("Running sweep of", len(combos), "simulations...")
 
-for dt_val, n_dom_val, order_val in combos:
-    res = run_simulation(dt_val, n_dom_val, order_val, max_steps, tol, (Xi, Yi))
-    results.append(res)
+print("\n[2/2] Running parameter study...")
+total_runs = len(dts) * len(n_doms) * len(orders)
+run_count = 0
 
-# ---- Find first common step where ALL runs have Δ < tol ----
-# consistent arrays up to max_steps; pad with last observed value (or +inf if not run)
-all_deltas = []
-for r in results:
-    arr = r['deltanorms']
-    if len(arr) < max_steps:
-        # pad with the last value repeated so indexing is safe (or a small number if they stopped early)
-        pad_val = arr[-1] if len(arr) > 0 else np.inf
-        arr_padded = np.concatenate([arr, np.full(max_steps - len(arr), pad_val)])
-    else:
-        arr_padded = arr[:max_steps]
-    all_deltas.append(arr_padded)
-all_deltas = np.vstack(all_deltas)  # shape (n_runs, max_steps)
+for dt in dts:
+    for n_dom in n_doms:
+        for order in orders:
+            run_count += 1
+            print(f"\n--- Run {run_count}/{total_runs} ---")
+            print(f"    dt={dt}, n_dom={n_dom}, order={order}")
 
-# at step j, find max across runs
-max_across = np.max(all_deltas, axis=0)
-common_stop = None
-for j in range(max_steps):
-    if max_across[j] < tol:
-        common_stop = j
-        break
+            # Run simulation
+            gfu, gfv, mesh = run_simulation(dt, n_dom, order, T_final, verbose=True)
 
-print("Common stopping step (first j where max across runs < tol):", common_stop)
+            # Compute errors against reference
+            l2_err_u, l2_norm_u = compute_L2_error(gfu, gfu_ref, mesh, mesh_ref)
+            l2_err_v, l2_norm_v = compute_L2_error(gfv, gfv_ref, mesh, mesh_ref)
 
-# ---- Pairwise comparisons of final u fields ----
-n_runs = len(results)
-final_u_vecs = [r['final_u_grid'].flatten() for r in results]
-final_v_vecs = [r['final_v_grid'].flatten() for r in results]
+            rel_err_u = l2_err_u / l2_norm_u if l2_norm_u > 0 else 0
+            rel_err_v = l2_err_v / l2_norm_v if l2_norm_v > 0 else 0
 
-# metrics: L2, L-inf, IoU on thresholded u
-def l2_norm(a, b):
-    return np.sqrt(np.mean((a - b)**2))
-def linf_norm(a, b):
-    return np.max(np.abs(a - b))
-def iou_binary(a, b, thr=0.5):
-    A = a > thr
-    B = b > thr
-    inter = np.logical_and(A, B).sum()
-    union = np.logical_or(A, B).sum()
-    return inter / union if union > 0 else 1.0
+            print(f"    L2 error (u): {l2_err_u:.6e}, relative: {rel_err_u:.6e}")
+            print(f"    L2 error (v): {l2_err_v:.6e}, relative: {rel_err_v:.6e}")
 
-pairwise_metrics = []
-for i in range(n_runs):
-    for j in range(i+1, n_runs):
-        u_i = final_u_vecs[i]; u_j = final_u_vecs[j]
-        l2 = l2_norm(u_i, u_j)
-        linf = linf_norm(u_i, u_j)
-        iou = iou_binary(u_i, u_j, thr=0.5)
-        pairwise_metrics.append({
-            'i': i, 'j': j,
-            'params_i': (results[i]['dt'], results[i]['n_dom'], results[i]['order']),
-            'params_j': (results[j]['dt'], results[j]['n_dom'], results[j]['order']),
-            'L2': l2, 'Linf': linf, 'IoU': iou
-        })
+            results.append({
+                'dt': dt,
+                'n_dom': n_dom,
+                'order': order,
+                'h': l_dom/n_dom,
+                'ndof': mesh.nv,
+                'l2_err_u': l2_err_u,
+                'l2_err_v': l2_err_v,
+                'rel_err_u': rel_err_u,
+                'rel_err_v': rel_err_v
+            })
+# ---------------------------------------
+# Save and visualize results
+# ---------------------------------------
 
-# ---- Save a summary table and plots ----
-import json
-summary = {
-    'run_summary': [
-        {
-            'index': idx,
-            'dt': r['dt'],
-            'n_dom': r['n_dom'],
-            'order': r['order'],
-            'stopping_step': r['stopping_step'],
-            'steps_ran': r['steps_ran']
-        } for idx, r in enumerate(results)
-    ],
-    'common_stop': common_stop,
-    'pairwise_metrics': pairwise_metrics
-}
-with open(os.path.join(output_dir, f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"), 'w') as f:
-    json.dump(summary, f, indent=2)
+df = pd.DataFrame(results)
 
-# plot max Δ across runs and per-run Δs for diagnostics
-plt.figure(figsize=(8,4))
-plt.semilogy(max_across, label='max Δ across runs')
-plt.axhline(tol, color='k', linestyle='--', label=f'tol={tol}')
-plt.xlabel('time step index j')
-plt.ylabel('Δ (deltauvNorm)')
-plt.legend()
+# Save results
+output_path = "output/"
+os.makedirs(output_path, exist_ok=True)
+date_time_tag = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+csv_file = f'{output_path}error_analysis_{date_time_tag}.csv'
+df.to_csv(csv_file, index=False)
+print(f"\n\nResults saved to: {csv_file}")
+
+# Create convergence plots
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+# Plot 1: Error vs dt (fixed n_dom, order)
+ax = axes[0, 0]
+for n_dom in n_doms:
+    for order in orders:
+        subset = df[(df['n_dom'] == n_dom) & (df['order'] == order)]
+        if len(subset) > 0:
+            ax.loglog(subset['dt'], subset['l2_err_u'], 'o-', 
+                     label=f'n={n_dom}, p={order}')
+ax.set_xlabel('dt')
+ax.set_ylabel('L2 Error (u)')
+ax.set_title('Temporal Convergence')
+ax.legend(fontsize=8)
+ax.grid(True)
+
+# Plot 2: Error vs h (fixed dt, varying order)
+ax = axes[0, 1]
+for dt in dts:
+    for order in orders:
+        subset = df[(df['dt'] == dt) & (df['order'] == order)]
+        if len(subset) > 0:
+            ax.loglog(subset['h'], subset['l2_err_u'], 'o-', 
+                     label=f'dt={dt}, p={order}')
+ax.set_xlabel('h (mesh size)')
+ax.set_ylabel('L2 Error (u)')
+ax.set_title('Spatial Convergence')
+ax.legend(fontsize=8)
+ax.grid(True)
+
+# Plot 3: Error vs order (fixed dt, n_dom)
+ax = axes[0, 2]
+for dt in dts:
+    for n_dom in n_doms:
+        subset = df[(df['dt'] == dt) & (df['n_dom'] == n_dom)]
+        if len(subset) > 0:
+            ax.semilogy(subset['order'], subset['l2_err_u'], 'o-', 
+                       label=f'dt={dt}, n={n_dom}')
+ax.set_xlabel('Polynomial Order')
+ax.set_ylabel('L2 Error (u)')
+ax.set_title('p-Convergence')
+ax.legend(fontsize=8)
+ax.grid(True)
+
+# Plots 4-6: Same for v component
+ax = axes[1, 0]
+for n_dom in n_doms:
+    for order in orders:
+        subset = df[(df['n_dom'] == n_dom) & (df['order'] == order)]
+        if len(subset) > 0:
+            ax.loglog(subset['dt'], subset['l2_err_v'], 'o-', 
+                     label=f'n={n_dom}, p={order}')
+ax.set_xlabel('dt')
+ax.set_ylabel('L2 Error (v)')
+ax.set_title('Temporal Convergence (v)')
+ax.legend(fontsize=8)
+ax.grid(True)
+
+ax = axes[1, 1]
+for dt in dts:
+    for order in orders:
+        subset = df[(df['dt'] == dt) & (df['order'] == order)]
+        if len(subset) > 0:
+            ax.loglog(subset['h'], subset['l2_err_v'], 'o-', 
+                     label=f'dt={dt}, p={order}')
+ax.set_xlabel('h (mesh size)')
+ax.set_ylabel('L2 Error (v)')
+ax.set_title('Spatial Convergence (v)')
+ax.legend(fontsize=8)
+ax.grid(True)
+
+ax = axes[1, 2]
+for dt in dts:
+    for n_dom in n_doms:
+        subset = df[(df['dt'] == dt) & (df['n_dom'] == n_dom)]
+        if len(subset) > 0:
+            ax.semilogy(subset['order'], subset['l2_err_v'], 'o-', 
+                       label=f'dt={dt}, n={n_dom}')
+ax.set_xlabel('Polynomial Order')
+ax.set_ylabel('L2 Error (v)')
+ax.set_title('p-Convergence (v)')
+ax.legend(fontsize=8)
+ax.grid(True)
+
 plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'convergence_max_across_runs.png'))
-plt.close()
+plot_file = f'{output_path}convergence_plots_{date_time_tag}.pdf'
+plt.savefig(plot_file)
+print(f"Convergence plots saved to: {plot_file}")
+plt.show()
 
-# save example final fields (first few runs)
-for idx, r in enumerate(results[:min(6, len(results))]):
-    plt.figure(figsize=(4,4))
-    plt.imshow(r['final_u_grid'] > 0.5, origin='lower', extent=[-l_dom/2, l_dom/2, -l_dom/2, l_dom/2])
-    plt.title(f"u > 0.5: dt={r['dt']}, n={r['n_dom']}, ord={r['order']}")
-    plt.axis('off')
-    plt.savefig(os.path.join(output_dir, f'final_u_binary_run{idx}.png'))
-    plt.close()
+# Print summary table
+print("\n" + "="*60)
+print("SUMMARY TABLE")
+print("="*60)
+print(df.to_string(index=False))
+print("\nAnalysis complete!")
 
-print("Sweep finished. Results and plots saved in", output_dir)
