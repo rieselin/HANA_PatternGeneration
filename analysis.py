@@ -11,8 +11,8 @@ from ngsolve import *
 # ---------------------------------------
 # Configuration
 # ---------------------------------------
-dts = [1.0, 5.0, 10.0]
-n_doms = [10, 20, 40]
+dts = [5.0] #, 5.0, 10.0 => test without varying dt
+n_doms = [5, 10, 20] # could be replaced with refine order 
 orders = [1, 2, 3]
 
 # Fixed parameters
@@ -28,9 +28,9 @@ max_newton_iter = 10
 newton_tol = 1e-8
 
 # Reference solution parameters (finest grid)
-dt_ref = 0.5
-n_dom_ref = 80
-order_ref = 3
+dt_ref = 5.0
+n_dom_ref = 40
+order_ref = 4
 
 # ---------------------------------------
 # Helper Functions
@@ -55,6 +55,7 @@ def set_initial_conditions(gfuold, gfvold, l_dom, n_dom):
 
     # Add same random seed for reproducibility
     np.random.seed(42)
+
     ndof = gfuold.space.ndof + gfvold.space.ndof
     return 0.01 * np.random.normal(size=ndof)
 
@@ -63,7 +64,7 @@ def run_simulation(dt, n_dom, order, T_final, verbose=False):
     
     # Create mesh
     mesh = create_mesh(l_dom, n_dom)
-    
+
     # Setup finite element space
     V = Periodic(H1(mesh, order=order))
     X = V * V
@@ -99,76 +100,83 @@ def run_simulation(dt, n_dom, order, T_final, verbose=False):
     m.Assemble()
     
     # M* = M + dt/2*A (for trapezoidal rule)
-    mstar = a.mat.CreateMatrix()
-    mstar.AsVector().data = m.mat.AsVector() + (dt/2.0) * a.mat.AsVector()
+    mstar = m.mat.CreateMatrix()
+    mstar.AsVector().data = m.mat.AsVector() + dt * a.mat.AsVector()
     mstarinv = mstar.Inverse(inverse="sparsecholesky")
-    
-    # Helper vectors
-    res = gfx.vec.CreateVector()
 
     f = LinearForm(X)
     f += dt*(-gfuold*gfvold**2+F*(1-gfuold))*w*dx(bonus_intorder=4)
     f += dt*(gfuold*gfvold**2-(k+F)*gfvold)*q*dx(bonus_intorder=4)
 
     res = gfx.vec.CreateVector()
-    deltauv = gfx.vec.CreateVector()
+    deltaufv = GridFunction(X)   # increment as GridFunction
+    deltauf, deltavf = deltaufv.components
     
     # Time stepping
     nsteps = int(T_final / dt)
     t = 0.0
     
+    delta_norms = []
+    time_points = []
+    
     with TaskManager():
         for j in range(nsteps):
+            t = j * dt  # update time
+            
             # Assemble right-hand side f (explicit nonlinearity)
             f.Assemble()
 
             # Solve M* δ = -dt*A*u_old + f
             res.data = -dt * a.mat * gfxold.vec + f.vec
-            deltauv.data = mstarinv * res
-            gfx.vec.data = gfxold.vec + deltauv
+
+            delta_vec = mstarinv * res
+            deltaufv.vec.data = delta_vec
+            gfx.vec.data = gfxold.vec + deltaufv.vec
+
+            try:
+                # If the integrator accepts expressions with gridfunction components:
+                deltau_norm_sq = Integrate(deltauf**2 + deltavf**2, mesh, bonus_intorder=4)
+                deltauvNorm = np.sqrt(deltau_norm_sq)
+            except Exception:
+                # Fallback: measure coefficient Euclidean norm (less precise but robust)
+                deltauvNorm = float(deltaufv.vec.Norm())
 
             # Update for next step
             gfxold.vec.data = gfx.vec
 
-            # Visualize every 10 steps
-            # if j % 10 == 0:
-            #     scene_u.Redraw()
-            #     scene_v.Redraw()
-            deltauvNorm = deltauv.Norm()
-            print(j,deltauvNorm,end='\r')
-                    
-            if deltauvNorm < newton_tol:
-                break
-                
-            gfxold.vec.data = gfx.vec
+            # Store norm history
+            delta_norms.append(deltauvNorm)
+            time_points.append(t)
+
+            if verbose and j % 100 == 0:
+                print(f"  Step {j}/{nsteps}, t={t:.2f}, ||delta||={deltauvNorm:.6e}", end='\r')
             
-            if verbose and j % 10 == 0:
-                print(f"  Step {j}/{nsteps}, t={t:.2f}", end='\r')
+            # Optional early stopping if stationary
+            # if deltauvNorm < newton_tol:
+            #     if verbose:
+            #         print(f"\n  Reached stationary solution at t={t:.2f}")
+            #     break
     
     if verbose:
         print(f"\nSimulation completed: dt={dt}, n_dom={n_dom}, order={order}")
     
-    return gfu, gfv, mesh
-
-def compute_L2_error(gfu1, gfu2, mesh1, mesh2):
-    """Compute L2 error between two solutions by interpolation"""
-    # Sample on a fine grid
+    # Return sampled values instead of GridFunctions for error computation
     Npixel = 200
     xi = np.linspace(-l_dom/2, l_dom/2, Npixel)
     Xi, Yi = np.meshgrid(xi, xi)
+    mips = mesh(Xi.flatten(), Yi.flatten())
     
-    mips1 = mesh1(Xi.flatten(), Yi.flatten())
-    mips2 = mesh2(Xi.flatten(), Yi.flatten())
+    u_vals = gfu(mips).reshape(Npixel, Npixel)
+    v_vals = gfv(mips).reshape(Npixel, Npixel)
     
-    u1_vals = gfu1(mips1)
-    u2_vals = gfu2(mips2)
-    
-    # L2 error
+    return u_vals, v_vals, np.array(delta_norms), np.array(time_points)
+
+
+def compute_L2_error(u1_vals, u2_vals):
+    """Compute L2 error between two sampled solutions"""
     diff = u1_vals - u2_vals
-    l2_error = np.sqrt(np.mean(diff**2))
-    l2_norm = np.sqrt(np.mean(u2_vals**2))
-    
-    return l2_error, l2_norm
+    l2_error = np.sqrt(np.sum(diff**2))
+    return l2_error
 
 # ---------------------------------------
 # Main Error Analysis
@@ -178,9 +186,24 @@ def compute_L2_error(gfu1, gfu2, mesh1, mesh2):
 # Compute reference solution
 print("\n[1/2] Computing reference solution...")
 print(f"    Parameters: dt={dt_ref}, n_dom={n_dom_ref}, order={order_ref}")
-gfu_ref, gfv_ref, mesh_ref = run_simulation(
+u_ref, v_ref, delta_norms_ref, time_points_ref = run_simulation(
     dt_ref, n_dom_ref, order_ref, T_final, verbose=True
 )
+
+# Plot reference delta norm evolution
+fig_ref, ax_ref = plt.subplots(figsize=(10, 6))
+ax_ref.semilogy(time_points_ref, delta_norms_ref)
+ax_ref.set_xlabel('Time')
+ax_ref.set_ylabel('||delta|| (norm of increment)')
+ax_ref.set_title('Convergence to Stationary Solution (Reference)')
+ax_ref.grid(True)
+plt.tight_layout()
+
+output_path = "output/"
+os.makedirs(output_path, exist_ok=True)
+date_time_tag = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+plt.savefig(f'{output_path}stationary_convergence_{date_time_tag}.pdf')
+print(f"Stationary convergence plot saved")
 
 # Store results
 results = []
@@ -197,29 +220,28 @@ for dt in dts:
             print(f"    dt={dt}, n_dom={n_dom}, order={order}")
 
             # Run simulation
-            gfu, gfv, mesh = run_simulation(dt, n_dom, order, T_final, verbose=True)
+            u_vals, v_vals, delta_norms, time_points = run_simulation(
+                dt, n_dom, order, T_final, verbose=True
+            )
 
             # Compute errors against reference
-            l2_err_u, l2_norm_u = compute_L2_error(gfu, gfu_ref, mesh, mesh_ref)
-            l2_err_v, l2_norm_v = compute_L2_error(gfv, gfv_ref, mesh, mesh_ref)
+            l2_err_u = compute_L2_error(u_vals, u_ref)
+            l2_err_v = compute_L2_error(v_vals, v_ref)
 
-            rel_err_u = l2_err_u / l2_norm_u if l2_norm_u > 0 else 0
-            rel_err_v = l2_err_v / l2_norm_v if l2_norm_v > 0 else 0
-
-            print(f"    L2 error (u): {l2_err_u:.6e}, relative: {rel_err_u:.6e}")
-            print(f"    L2 error (v): {l2_err_v:.6e}, relative: {rel_err_v:.6e}")
+            print(f"    L2 error (u): {l2_err_u:.6e}")
+            print(f"    L2 error (v): {l2_err_v:.6e}")
 
             results.append({
                 'dt': dt,
                 'n_dom': n_dom,
                 'order': order,
                 'h': l_dom/n_dom,
-                'ndof': mesh.nv,
+                'ndof': (n_dom+1)**2,  # Approximate for structured mesh
                 'l2_err_u': l2_err_u,
                 'l2_err_v': l2_err_v,
-                'rel_err_u': rel_err_u,
-                'rel_err_v': rel_err_v
+                'final_delta_norm': delta_norms[-1]
             })
+
 # ---------------------------------------
 # Save and visualize results
 # ---------------------------------------
@@ -227,9 +249,6 @@ for dt in dts:
 df = pd.DataFrame(results)
 
 # Save results
-output_path = "output/"
-os.makedirs(output_path, exist_ok=True)
-date_time_tag = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 csv_file = f'{output_path}error_analysis_{date_time_tag}.csv'
 df.to_csv(csv_file, index=False)
 print(f"\n\nResults saved to: {csv_file}")
@@ -247,7 +266,7 @@ for n_dom in n_doms:
                      label=f'n={n_dom}, p={order}')
 ax.set_xlabel('dt')
 ax.set_ylabel('L2 Error (u)')
-ax.set_title('Temporal Convergence')
+ax.set_title('Temporal Convergence (u)')
 ax.legend(fontsize=8)
 ax.grid(True)
 
@@ -261,7 +280,7 @@ for dt in dts:
                      label=f'dt={dt}, p={order}')
 ax.set_xlabel('h (mesh size)')
 ax.set_ylabel('L2 Error (u)')
-ax.set_title('Spatial Convergence')
+ax.set_title('Spatial Convergence (u)')
 ax.legend(fontsize=8)
 ax.grid(True)
 
@@ -275,7 +294,7 @@ for dt in dts:
                        label=f'dt={dt}, n={n_dom}')
 ax.set_xlabel('Polynomial Order')
 ax.set_ylabel('L2 Error (u)')
-ax.set_title('p-Convergence')
+ax.set_title('p-Convergence (u)')
 ax.legend(fontsize=8)
 ax.grid(True)
 
@@ -331,4 +350,3 @@ print("SUMMARY TABLE")
 print("="*60)
 print(df.to_string(index=False))
 print("\nAnalysis complete!")
-
